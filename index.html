@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WebXR + WebRTC (PeerJS) — AR cubes + audio</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; font-family:system-ui, sans-serif; }
+    #ui {
+      position: fixed; top: 12px; left: 12px; z-index: 10;
+      background: rgba(255,255,255,0.9); padding: 10px; border-radius: 8px; max-width: 92vw;
+    }
+    #ui p { margin: 0 0 6px 0; font-size: 14px; }
+    #ui input { width: 180px; }
+    #status { font-size: 12px; opacity: .8; margin-top: 6px; }
+    video { display:none; }
+    #xrBtnWrap { position: fixed; right: 12px; top: 12px; z-index: 10; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <p>Your ID: <strong id="myId">…</strong></p>
+    <input id="peerIdInput" placeholder="Peer ID" />
+    <button id="connectBtn">Connect</button>
+    <div id="status">idle</div>
+  </div>
+  <div id="xrBtnWrap"></div>
+
+  <!-- hidden media elements -->
+  <video id="localVideo" autoplay muted playsinline></video>
+  <audio id="remoteAudio" autoplay playsinline></audio>
+
+  <!-- PeerJS -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+
+  <!-- Three.js (ESM) -->
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.164.0/build/three.module.js';
+    import { ARButton } from 'https://cdn.jsdelivr.net/npm/three@0.164.0/examples/jsm/webxr/ARButton.js';
+
+    // ---------- UI ----------
+    const myIdEl = document.getElementById('myId');
+    const peerInput = document.getElementById('peerIdInput');
+    const connectBtn = document.getElementById('connectBtn');
+    const statusEl = document.getElementById('status');
+    const xrBtnWrap = document.getElementById('xrBtnWrap');
+
+    function setStatus(s){ statusEl.textContent = s; console.log('[status]', s); }
+
+    // ---------- Media (audio only to avoid camera/WebXR conflict) ----------
+    const localVideo = document.getElementById('localVideo');
+    const remoteAudio = document.getElementById('remoteAudio');
+    let localStream = null;
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video:false, audio:true });
+      localVideo.srcObject = localStream; // keeps mic alive
+      setStatus('mic ready');
+    } catch (e) {
+      alert('Microphone permission required. ' + e);
+      throw e;
+    }
+
+    // ---------- PeerJS ----------
+    const dune = ["Arrakis","Fremen","Sietch","ShaiHulud","Spice","BeneGesserit","Kwizatz","Harkonnen","Atreides","MuadDib"];
+    const ng = ["Lagos","Abuja","Kano","Ibadan","PortHarcourt","Enugu","Kaduna","Jos","Benin","Yola"];
+    const randId = () => `${dune[Math.floor(Math.random()*dune.length)]}-${ng[Math.floor(Math.random()*ng.length)]}-${Math.floor(Math.random()*1000)}`;
+
+    // Optional: add your own TURN here for mobile NATs.
+    // const peer = new Peer(randId(), { config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}, {urls:'turn:YOUR_TURN', username:'user', credential:'pass'}] }});
+    const peer = new Peer(randId()); // PeerJS cloud STUN only
+
+    let dataConn = null;
+    let mediaCall = null;
+
+    peer.on('open', id => { myIdEl.textContent = id; setStatus('peer ready'); });
+    peer.on('error', err => setStatus('peer error: ' + err));
+
+    // Incoming data channel
+    peer.on('connection', conn => {
+      dataConn = conn;
+      wireDataConn();
+    });
+
+    // Incoming media call
+    peer.on('call', call => {
+      mediaCall = call;
+      call.answer(localStream);
+      call.on('stream', s => {
+        remoteAudio.srcObject = s;
+        remoteAudio.play().catch(()=>{ /* will play after XR gesture */ });
+        setStatus('audio connected');
+      });
+    });
+
+    connectBtn.onclick = () => {
+      const remoteId = peerInput.value.trim();
+      if(!remoteId){ alert('Enter Peer ID'); return; }
+
+      // Data channel
+      dataConn = peer.connect(remoteId, { reliable: true });
+      wireDataConn();
+
+      // Media call (audio)
+      mediaCall = peer.call(remoteId, localStream);
+      mediaCall.on('stream', s => {
+        remoteAudio.srcObject = s;
+        remoteAudio.play().catch(()=>{ /* play after XR button click */ });
+        setStatus('audio connected');
+      });
+    };
+
+    function wireDataConn(){
+      setStatus('signaling…');
+      dataConn.on('open', () => {
+        setStatus('data channel open');
+        // announce my desired peer cube color
+        dataConn.send({ type:'hello', wantPeerCubeColor: 'green' }); // this device wants the peer to render green
+      });
+      dataConn.on('data', msg => handlePeerMsg(msg));
+      dataConn.on('close', ()=> setStatus('data channel closed'));
+      dataConn.on('error', e => setStatus('data channel error: '+e));
+    }
+
+    // ---------- Three.js + WebXR ----------
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+    const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 1.0));
+
+    // Cube the *peer* controls on this device
+    const peerCubeMat = new THREE.MeshStandardMaterial({ color: 'white' });
+    const peerCube = new THREE.Mesh(new THREE.BoxGeometry(0.18,0.18,0.18), peerCubeMat);
+    peerCube.visible = false;
+    scene.add(peerCube);
+
+    // local desired color for the peer to render on their side
+    // Phone A should change this to 'red'. Phone B leaves 'green'.
+    // For test: default uses green. Toggle quickly via hash: #red or #green
+    const myDesiredPeerColor = (location.hash.replace('#','') === 'red') ? 'red' : 'green';
+
+    // XR button
+    const xrBtn = ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] });
+    xrBtnWrap.appendChild(xrBtn);
+
+    // Hit-test setup
+    let xrRefSpace = null;
+    let hitTestSource = null;
+
+    renderer.xr.addEventListener('sessionstart', async () => {
+      remoteAudio.play().catch(()=>{}); // user gesture has happened
+      const session = renderer.xr.getSession();
+      xrRefSpace = await session.requestReferenceSpace('local');
+      const viewerSpace = await session.requestReferenceSpace('viewer');
+      hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+      // XR select places YOUR cube on the REMOTE device
+      session.addEventListener('select', onSelect);
+      setStatus('AR running. Tap to place peer cube remotely.');
+    });
+
+    renderer.xr.addEventListener('sessionend', () => {
+      hitTestSource = null;
+      xrRefSpace = null;
+      setStatus('AR session ended');
+    });
+
+    async function onSelect(ev){
+      if (!hitTestSource || !xrRefSpace) return;
+
+      const frame = ev.frame;
+      const refSpace = xrRefSpace;
+      const hitResults = frame.getHitTestResults(hitTestSource);
+      if (hitResults.length === 0) return;
+
+      const hitPose = hitResults[0].getPose(refSpace);
+      // Send transform to peer. They will show their local peerCube there.
+      const p = [hitPose.transform.position.x, hitPose.transform.position.y, hitPose.transform.position.z];
+      const q = [
+        hitPose.transform.orientation.x,
+        hitPose.transform.orientation.y,
+        hitPose.transform.orientation.z,
+        hitPose.transform.orientation.w
+      ];
+      dataConn?.send({ type:'pose', position:p, quaternion:q, scale:1.0 });
+      // Also inform color preference in case not sent yet
+      dataConn?.send({ type:'hello', wantPeerCubeColor: myDesiredPeerColor });
+      setStatus('sent pose to peer');
+    }
+
+    function handlePeerMsg(msg){
+      if (msg?.type === 'hello') {
+        // The peer tells me what color they want their cube to appear on my device
+        const c = msg.wantPeerCubeColor || 'green';
+        peerCube.material.color.set(c);
+        peerCube.visible = true;
+        setStatus('peer color: ' + c);
+      }
+      if (msg?.type === 'pose') {
+        // The peer tapped. I place/update THEIR cube locally.
+        peerCube.visible = true;
+        peerCube.position.fromArray(msg.position || [0,0,-1]);
+        if (Array.isArray(msg.quaternion) && msg.quaternion.length === 4) {
+          peerCube.quaternion.set(msg.quaternion[0], msg.quaternion[1], msg.quaternion[2], msg.quaternion[3]);
+        }
+        const s = msg.scale || 1;
+        peerCube.scale.setScalar(s);
+        setStatus('peer cube placed');
+      }
+    }
+
+    // Render loop
+    renderer.setAnimationLoop((t, frame) => {
+      renderer.render(scene, camera);
+    });
+
+    // Resize
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // Announce my desired color on data open as well
+    // If dataConn was already open before XR start, resend on XR button click
+    xrBtn.addEventListener('click', () => {
+      dataConn?.open && dataConn.send({ type:'hello', wantPeerCubeColor: myDesiredPeerColor });
+    });
+  </script>
+</body>
+</html>
